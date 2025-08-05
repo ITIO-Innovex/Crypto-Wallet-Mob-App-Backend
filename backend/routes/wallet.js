@@ -244,6 +244,95 @@ router.post('/createCryptoWallet', authMiddleware, async (req, res) => {
   }
 });
 
+//Update Fiat Amount
+router.post('/FiatAmountUpdate', authMiddleware, async (req, res) => {
+  const { userId, currency, amount } = req.body;
+
+  // Validate request body
+  if (!userId || !currency || !amount || amount <= 0) {
+    return res.status(400).json({
+      status: 400,
+      message: 'Missing or invalid parameters: userId, currency, and amount are required',
+    });
+  }
+
+  // Ensure the authenticated user matches the provided userId
+  if (userId !== req.user.userId) {
+    return res.status(403).json({
+      status: 403,
+      message: 'Unauthorized: Cannot update wallet for another user',
+    });
+  }
+
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    // Find the fiat wallet
+    let wallet = await Wallet.findOne({
+      userId,
+      currency: currency.toUpperCase(),
+    }).session(session);
+
+    if (!wallet) {
+      await session.abortTransaction();
+      return res.status(404).json({
+        status: 404,
+        message: 'Wallet not found for the specified user and currency',
+      });
+    }
+
+    // Check if sufficient balance
+    if (wallet.balance < amount) {
+      await session.abortTransaction();
+      return res.status(400).json({
+        status: 400,
+        message: 'Insufficient balance in wallet',
+      });
+    }
+
+    // Update balance by deducting amount
+    wallet.balance = wallet.balance - amount;
+    await wallet.save({ session });
+
+    // Create a transaction record
+    const transaction = new Transaction({
+      userId,
+      amount,
+      currency: currency.toUpperCase(),
+      type: 'withdraw',
+      status: 'success',
+      gateway: 'internal',
+      gatewayId: `fiat_withdrawal_${Date.now()}`,
+      walletType: 'fiat',
+      createdAt: new Date(),
+    });
+    await transaction.save({ session });
+
+    await session.commitTransaction();
+
+    // Format response to match Wallet model expected by frontend
+    res.status(200).json({
+      _id: wallet._id,
+      userId: wallet.userId,
+      currency: wallet.currency,
+      balance: wallet.balance,
+      createdAt: wallet.createdAt,
+    });
+  } catch (error) {
+    await session.abortTransaction();
+    console.error('Error updating wallet balance:', error.message);
+    res.status(500).json({
+      status: 500,
+      message: 'Failed to update wallet balance',
+      error: error.message,
+    });
+  } finally {
+    session.endSession();
+  }
+});
+
+
 // Update Crypto Wallet Balance
 router.post('/CryptoAmountUpdate', authMiddleware, async (req, res) => {
   const { userId, currency, address, amount } = req.body;
@@ -476,16 +565,28 @@ async function getVaultAccountByName(email) {
 // Helper Functions
 async function getOrCreateVaultAccount(email) {
   try {
+    if (!email || typeof email !== 'string' || !email.trim()) {
+      throw new Error('Invalid email provided for vault account name');
+    }
+
     const existingVaultId = await getVaultAccountByName(email);
     if (existingVaultId) return existingVaultId;
 
-    const vaultAccount = await fireblocks.createVaultAccount({ name: email, autoFuel: false, hiddenOnUI: false });
+    const vaultAccount = await fireblocks.createVaultAccount({
+      name: email.trim(),
+      autoFuel: false,
+      hiddenOnUI: false
+    });
+
     if (!vaultAccount || !vaultAccount.id) {
       throw new Error('Failed to create vault account: No vault ID returned');
     }
+
     return vaultAccount.id;
   } catch (error) {
-    console.error('Vault account error at:', new Date().toISOString(), { error: error?.response?.data || error.message });
+    console.error('Vault account error at:', new Date().toISOString(), {
+      error: error?.response?.data || error.message
+    });
     return null;
   }
 }
