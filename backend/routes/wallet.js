@@ -764,6 +764,135 @@ router.post('/add-money/razorpay', authMiddleware, async (req, res) => {
     return res.status(500).json({ error: err.message || 'Internal server error' });
   }
 });
+
+// Confirm Razorpay Payment Endpoint
+router.post('/confirm-payment/razorpay', authMiddleware, async (req, res) => {
+  try {
+    const { paymentId, orderId } = req.body;
+    const userId = req.user.userId;
+
+    // Validate inputs
+    if (!paymentId || !orderId) {
+      console.error('Missing parameters:', { paymentId, orderId, userId });
+      return res.status(400).json({
+        status: 400,
+        message: 'Missing required parameters: paymentId and orderId are required',
+      });
+    }
+
+    // Log incoming request
+    console.log('Confirming Razorpay payment:', { paymentId, orderId, userId });
+
+    // Start MongoDB session for transaction
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+      // Fetch payment details from Razorpay
+      const payment = await razorpay.payments.fetch(paymentId);
+      console.log('Razorpay Payment Details:', JSON.stringify(payment, null, 2));
+
+      // Verify the payment belongs to the order
+      if (payment.order_id !== orderId) {
+        await session.abortTransaction();
+        console.error('Payment does not match order:', { paymentId, orderId, paymentOrderId: payment.order_id });
+        return res.status(400).json({
+          status: 400,
+          message: 'Payment does not match the order',
+        });
+      }
+
+      // Check payment status
+      if (payment.status === 'authorized' || payment.status === 'captured') {
+        // Find the transaction (check both pending and success)
+        let transaction = await Transaction.findOne({
+          userId,
+          gatewayId: orderId,
+          status: { $in: ['pending', 'success'] },
+        }).session(session);
+
+        if (!transaction) {
+          await session.abortTransaction();
+          console.error('Transaction not found:', { userId, orderId });
+          return res.status(404).json({
+            status: 404,
+            message: 'Transaction not found',
+          });
+        }
+
+        // If transaction is already success, check wallet and return
+        if (transaction.status === 'success') {
+          console.log(`Transaction ${orderId} already processed for user ${userId}`);
+          let wallet = await Wallet.findOne({ userId, currency: transaction.currency }).session(session);
+          console.log(`Wallet check: ${JSON.stringify(wallet, null, 2)}`);
+          await session.commitTransaction();
+          return res.status(200).json({
+            status: 200,
+            message: 'Payment already confirmed',
+          });
+        }
+
+        // Update transaction status
+        transaction.status = 'success';
+        await transaction.save({ session });
+        console.log(`Transaction ${orderId} updated to success for user ${userId}`);
+
+        // Update wallet balance
+        let wallet = await Wallet.findOne({
+          userId,
+          currency: transaction.currency,
+        }).session(session);
+
+        if (!wallet) {
+          console.log(`Creating new wallet for user ${userId}, currency ${transaction.currency}`);
+          wallet = new Wallet({
+            userId,
+            currency: transaction.currency,
+            balance: 0,
+          });
+        }
+
+        console.log(`Wallet before update: ${JSON.stringify(wallet, null, 2)}`);
+        wallet.balance += transaction.amount;
+        try {
+          await wallet.save({ session });
+          console.log(`Wallet after update: ${JSON.stringify(wallet, null, 2)}`);
+        } catch (saveErr) {
+          console.error('Wallet save error:', saveErr.message, saveErr.stack);
+          throw saveErr;
+        }
+
+        await session.commitTransaction();
+        console.log(`Payment confirmed successfully for user ${userId}, order ${orderId}`);
+        res.status(200).json({
+          status: 200,
+          message: 'Payment confirmed successfully',
+        });
+      } else {
+        await session.abortTransaction();
+        console.error('Payment not successful:', { paymentId, status: payment.status });
+        return res.status(400).json({
+          status: 400,
+          message: `Payment not successful: ${payment.status}`,
+        });
+      }
+    } catch (err) {
+      await session.abortTransaction();
+      console.error('Error in transaction:', err.message, err.stack);
+      throw err;
+    } finally {
+      session.endSession();
+    }
+  } catch (err) {
+    console.error('Error confirming Razorpay payment:', err.message, err.stack);
+    res.status(500).json({
+      status: 500,
+      message: 'Failed to confirm payment',
+      error: err.message,
+    });
+  }
+});
+
 // Webhook for Stripe
 router.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
@@ -806,23 +935,38 @@ router.post('/webhook/razorpay', async (req, res) => {
 
   if (digest === req.headers['x-razorpay-signature']) {
     const { event, payload } = req.body;
+    console.log('Webhook received:', { event, orderId: payload.payment?.entity?.order_id });
 
     if (event === 'payment.authorized') {
       const payment = payload.payment.entity;
+      console.log('Processing payment.authorized:', { paymentId: payment.id, orderId: payment.order_id });
+
       const transaction = await Transaction.findOne({ gatewayId: payment.order_id });
 
       if (transaction && transaction.status === 'pending') {
+        console.log(`Webhook updating transaction ${payment.order_id} to success for user ${transaction.userId}`);
         transaction.status = 'success';
         await transaction.save();
 
         let wallet = await Wallet.findOne({ userId: transaction.userId, currency: transaction.currency });
         if (!wallet) {
+          console.log(`Webhook creating wallet for user ${transaction.userId}, currency ${transaction.currency}`);
           wallet = new Wallet({ userId: transaction.userId, currency: transaction.currency, balance: 0 });
         }
+        console.log(`Webhook wallet before update: ${JSON.stringify(wallet, null, 2)}`);
         wallet.balance += transaction.amount;
-        await wallet.save();
+        try {
+          await wallet.save();
+          console.log(`Webhook wallet after update: ${JSON.stringify(wallet, null, 2)}`);
+        } catch (saveErr) {
+          console.error('Webhook wallet save error:', saveErr.message, saveErr.stack);
+        }
+      } else {
+        console.log(`Webhook skipped: Transaction ${payment.order_id} not found or already processed`);
       }
     }
+  } else {
+    console.error('Webhook signature verification failed');
   }
 
   res.json({ status: 'ok' });
