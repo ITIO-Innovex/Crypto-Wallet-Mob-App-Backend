@@ -544,20 +544,28 @@ router.post('/sellCrypto', authMiddleware, async (req, res) => {
 
 async function getVaultAccountByName(email) {
   try {
-    const vaultAccounts = await fireblocks.getVaultAccountsWithPageInfo({ namePrefix: email });
+    console.log('🔍 Searching for vault account with email:', email, 'Type:', typeof email);
+    
+    // Get all vault accounts without any filter first
+    const vaultAccounts = await fireblocks.getVaultAccountsWithPageInfo();
 
-    if (vaultAccounts.accounts && vaultAccounts.accounts.length > 0) {
-      // Find exact match (case insensitive)
+    console.log('📋 Vault accounts response:', vaultAccounts);
+
+    if (vaultAccounts && vaultAccounts.accounts && vaultAccounts.accounts.length > 0) {
+      // Match exact name
       const vault = vaultAccounts.accounts.find(
         account => account.name.toLowerCase() === email.toLowerCase()
       );
       if (vault) {
+        console.log('✅ Found matching vault:', vault.id);
         return vault.id;
       }
     }
+
+    console.log('❌ No matching vault found');
     return null;
   } catch (error) {
-    console.error('Error in getVaultAccountByName:', error);
+    console.error('Error in getVaultAccountByName:', error?.response?.data || error.message);
     return null;
   }
 }
@@ -565,18 +573,38 @@ async function getVaultAccountByName(email) {
 // Helper Functions
 async function getOrCreateVaultAccount(email) {
   try {
-    if (!email || typeof email !== 'string' || !email.trim()) {
+    console.log('🚀 getOrCreateVaultAccount called with email:', email, 'Type:', typeof email);
+    
+    if (!email || typeof email !== 'string') {
       throw new Error('Invalid email provided for vault account name');
     }
 
-    const existingVaultId = await getVaultAccountByName(email);
-    if (existingVaultId) return existingVaultId;
+    const cleanedEmail = email.trim();
+    if (!cleanedEmail) throw new Error('Email is empty after trimming');
 
-    const vaultAccount = await fireblocks.createVaultAccount({
-      name: email.trim(),
+    // Create a vault-safe name (ASCII alphanumeric only)
+    const vaultSafeName = cleanedEmail.replace(/[^a-zA-Z0-9]/g, '_');
+    console.log('🧹 Cleaned email:', cleanedEmail);
+    console.log('🔒 Vault safe name:', vaultSafeName);
+    
+    const existingVaultId = await getVaultAccountByName(vaultSafeName);
+
+    if (existingVaultId) {
+      console.log('✅ Reusing existing vault for:', vaultSafeName, 'Vault ID:', existingVaultId);
+      return existingVaultId;
+    }
+
+    // 💥 Don't try to create again if it already exists with error
+    const customerRefId = `vault_${vaultSafeName}_${Date.now()}`;
+    console.log('🔨 Creating vault account with params:', {
+      name: vaultSafeName,
+      customerRefId: customerRefId,
       autoFuel: false,
       hiddenOnUI: false
     });
+    
+    // Try with just the name parameter first
+    const vaultAccount = await fireblocks.createVaultAccount(vaultSafeName);
 
     if (!vaultAccount || !vaultAccount.id) {
       throw new Error('Failed to create vault account: No vault ID returned');
@@ -584,12 +612,13 @@ async function getOrCreateVaultAccount(email) {
 
     return vaultAccount.id;
   } catch (error) {
-    console.error('Vault account error at:', new Date().toISOString(), {
+    console.error('❌ Vault account error at:', new Date().toISOString(), {
       error: error?.response?.data || error.message
     });
     return null;
   }
 }
+
 
 async function createVaultWalletAddress(userId, assetId, vaultAccountId, coinName, session) {
   try {
