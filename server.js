@@ -27,6 +27,7 @@ app.use('/api/kyc', require('./backend/routes/kyc'));
 app.use('/api/profile', require('./backend/routes/profile'));
 app.use('/api/wallet', require('./backend/routes/wallet'));
 app.use('/api/settings', require('./backend/routes/SettingsPage'));
+app.use('/api/notifications', require('./backend/routes/notifications'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
